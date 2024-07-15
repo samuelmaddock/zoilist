@@ -28,35 +28,86 @@ const octokit = new ProbotOctokit();
 //   }
 // }
 
-async function main() {
+async function findStaleRFCs() {
+  const twoWeeksAgoDate = new Date();
+  twoWeeksAgoDate.setDate(twoWeeksAgoDate.getDate() - 14);
+
   const q = `is:pr is:open -is:draft -label:"pending-changes"`;
-  const items = await octokit.paginate(octokit.search.issuesAndPullRequests, {
+  const prs = await octokit.paginate(octokit.search.issuesAndPullRequests, {
     q: `repo:electron/rfcs ${q}`,
     sort: 'created',
     order: 'asc',
   });
 
-  // const apiWg = await getApiWGMembers();
-  // console.log(apiWg);
-  
-  if (items.length) {
-    // console.log('rfcs', items);
-    for (const item of items) {
-      const { data: comments } = await octokit.issues.listComments({
-        owner: 'electron',
-        repo: 'rfcs',
-        issue_number: item.number
-      });
-      console.log(`comments for ${item.title}`, comments);
-      
-      const { data: reviewComments } = await octokit.pulls.listReviewComments({
-        owner: 'electron',
-        repo: 'rfcs',
-        pull_number: item.number
-      });
-      console.log(`review comments for ${item.title}`, reviewComments);
+  const getDetails = (comment: any) => ({
+    'user.login': comment.user.login,
+    'user.type': comment.user.type,
+    author_association: comment.author_association,
+    pull_request_review_id: comment.pull_request_review_id,
+    issue_url: comment.issue_url,
+    created_at: comment.created_at,
+  });
+
+  const stalePrs: (typeof prs)[0][] = [];
+
+  if (prs.length) {
+    for (const pr of prs) {
+      const [{ data: comments }, { data: reviewComments }] = await Promise.all([
+        octokit.issues.listComments({
+          owner: 'electron',
+          repo: 'rfcs',
+          issue_number: pr.number,
+        }),
+        octokit.pulls.listReviewComments({
+          owner: 'electron',
+          repo: 'rfcs',
+          pull_number: pr.number,
+        }),
+      ]);
+
+      const allComments = [...comments, ...reviewComments];
+
+      let latestComment: (typeof allComments)[0] | undefined;
+      let latestCommentDate: Date | undefined;
+
+      for (const comment of allComments) {
+        const createdAtDate = new Date(comment.created_at);
+
+        // Ignore older comments if one has been found
+        if (latestCommentDate && latestCommentDate > createdAtDate) continue;
+
+        // Ignore bots
+        if (comment.user?.type !== 'User') continue;
+
+        // Ignore non-member comments
+        if (!['MEMBER', 'OWNER'].includes(comment.author_association)) continue;
+
+        latestComment = comment;
+        latestCommentDate = createdAtDate;
+      }
+
+      console.log(
+        `latest comment for ${pr.title}`,
+        latestComment ? getDetails(latestComment) : null,
+      );
+      const isStale = !latestCommentDate || latestCommentDate < twoWeeksAgoDate;
+
+      if (isStale) {
+        stalePrs.push(pr);
+      }
     }
   }
+
+  return stalePrs;
+}
+
+async function main() {
+  const staleRFCs = await findStaleRFCs();
+
+  console.log(
+    'stale RFCs',
+    staleRFCs.map((pr) => pr.title),
+  );
 }
 
 if (require.main === module) main();
