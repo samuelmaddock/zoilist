@@ -52,6 +52,11 @@ async function findStaleRFCs() {
 
   if (prs.length) {
     for (const pr of prs) {
+      const createdAtDate = new Date(pr.created_at);
+
+      // Skip new PRs
+      if (twoWeeksAgoDate < createdAtDate) continue;
+
       const [comments, reviewComments] = await Promise.all([
         octokit.paginate(octokit.issues.listComments, {
           owner: 'electron',
