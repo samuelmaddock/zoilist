@@ -52,13 +52,13 @@ async function findStaleRFCs() {
 
   if (prs.length) {
     for (const pr of prs) {
-      const [{ data: comments }, { data: reviewComments }] = await Promise.all([
-        octokit.issues.listComments({
+      const [comments, reviewComments] = await Promise.all([
+        octokit.paginate(octokit.issues.listComments, {
           owner: 'electron',
           repo: 'rfcs',
           issue_number: pr.number,
         }),
-        octokit.pulls.listReviewComments({
+        octokit.paginate(octokit.pulls.listReviewComments, {
           owner: 'electron',
           repo: 'rfcs',
           pull_number: pr.number,
@@ -80,6 +80,7 @@ async function findStaleRFCs() {
         if (comment.user?.type !== 'User') continue;
 
         // Ignore non-member comments
+        // TODO(smaddock): check for wg-api team membership
         if (!['MEMBER', 'OWNER'].includes(comment.author_association)) continue;
 
         latestComment = comment;
