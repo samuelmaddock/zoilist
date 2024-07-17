@@ -4,28 +4,16 @@ import { isQuietPeriod, timeAgo } from './util';
 import { Endpoints } from '@octokit/types';
 const { SLACK_BOT_TOKEN, NODE_ENV } = process.env;
 
-if (!SLACK_BOT_TOKEN && NODE_ENV !== 'test' && 0) {
+if (!SLACK_BOT_TOKEN && NODE_ENV !== 'test') {
   console.error('Missing environment variable SLACK_BOT_TOKEN');
   process.exit(1);
 }
 
 type IssueOrPullRequest = Endpoints['GET /search/issues']['response']['data']['items'][number];
-// type Comment = RestEndpointMethodTypes['issues']['listComments']['response']['data'][0];
-// type ReviewComment = RestEndpointMethodTypes['pulls']['listReviewComments']['response']['data'][0];
-// type CommentOrReviewComment = Comment | ReviewComment;
 
 const slack = new WebClient(SLACK_BOT_TOKEN);
 
 const octokit = new ProbotOctokit();
-
-const getCommentInfo = (comment: any) => ({
-  'user.login': comment.user.login,
-  'user.type': comment.user.type,
-  author_association: comment.author_association,
-  pull_request_review_id: comment.pull_request_review_id,
-  issue_url: comment.issue_url,
-  created_at: comment.created_at,
-});
 
 function getOwnerAndRepoFromUrl(url: string) {
   const urlObj = new URL(url);
@@ -34,12 +22,10 @@ function getOwnerAndRepoFromUrl(url: string) {
   return { owner, repo };
 }
 
-async function getReviewComments(pr: IssueOrPullRequest) {
-  if (pr.comments === 0) return [];
-
+async function getReviewActivity(pr: IssueOrPullRequest) {
   const { owner, repo } = getOwnerAndRepoFromUrl(pr.repository_url);
 
-  const [comments, reviewComments] = await Promise.all([
+  const [comments, reviewComments, reviews] = await Promise.all([
     octokit.paginate(octokit.issues.listComments, {
       owner,
       repo,
@@ -50,43 +36,72 @@ async function getReviewComments(pr: IssueOrPullRequest) {
       repo,
       pull_number: pr.number,
     }),
+    octokit.paginate(octokit.pulls.listReviews, {
+      owner,
+      repo,
+      pull_number: pr.number,
+    }),
   ]);
 
-  return [...comments, ...reviewComments];
+  return [
+    ...comments.map((item) => ({
+      type: 'comment',
+      user: item.user,
+      author_association: item.author_association,
+      created_at: new Date(item.created_at),
+    })),
+    ...reviewComments.map((item) => ({
+      type: 'review_comment',
+      user: item.user,
+      author_association: item.author_association,
+      created_at: new Date(item.created_at),
+    })),
+    ...reviews.map((item) => ({
+      type: 'review',
+      user: item.user,
+      author_association: item.author_association,
+      created_at: new Date(item.submitted_at!),
+    })),
+  ];
 }
 
-async function findLatestTeamReviewComment(pr: IssueOrPullRequest) {
-  const comments = await getReviewComments(pr);
+type PullRequestActivity = Awaited<ReturnType<typeof getReviewActivity>>[number];
 
-  let latestComment: (typeof comments)[0] | undefined;
-  let latestCommentDate: Date | undefined;
+async function findLatestTeamReviewActivity(pr: IssueOrPullRequest) {
+  const allActivity = await getReviewActivity(pr);
 
-  for (const comment of comments) {
-    const createdAtDate = new Date(comment.created_at);
+  let latestActivity: PullRequestActivity | undefined;
+  let latestActivityDate: Date | undefined;
 
+  for (const activity of allActivity) {
     // Ignore older comments if one has been found
-    if (latestCommentDate && latestCommentDate > createdAtDate) continue;
+    if (latestActivityDate && latestActivityDate > activity.created_at) continue;
 
     // Ignore bots
-    if (comment.user?.type !== 'User') continue;
+    if (activity.user?.type !== 'User') continue;
 
     // Skip comments by PR authors
-    if (comment.user.login === pr.user?.login) continue;
+    if (activity.user?.login === pr.user?.login) continue;
 
+    // TODO(smaddock): check for wg-api team membership instead
     // Ignore non-member comments
-    // TODO(smaddock): check for wg-api team membership
-    if (!['MEMBER', 'OWNER'].includes(comment.author_association)) continue;
+    // If folks' org membership is set to private, they'll appear as contributor
+    if (!['MEMBER', 'OWNER', 'CONTRIBUTOR'].includes(activity.author_association)) continue;
 
-    latestComment = comment;
-    latestCommentDate = createdAtDate;
+    latestActivity = activity;
+    latestActivityDate = activity.created_at;
   }
 
-  console.log(
-    `latest comment for ${pr.title}`,
-    latestComment ? getCommentInfo(latestComment) : null,
-  );
+  return latestActivity;
+}
 
-  return latestComment;
+async function getActivityForPRs(prs: IssueOrPullRequest[]) {
+  const activity: Record<number, PullRequestActivity | void> = {};
+  for (const pr of prs) {
+    const latestActivity = await findLatestTeamReviewActivity(pr);
+    activity[pr.number] = latestActivity;
+  }
+  return activity;
 }
 
 async function getElectronPRs() {
@@ -95,17 +110,14 @@ async function getElectronPRs() {
     q: `repo:electron/electron ${query}`,
     sort: 'created',
   });
-
-  const activity: Record<number, Date> = {};
-  for (const item of items) {
-    const latestComment = await findLatestTeamReviewComment(item);
-    if (latestComment) {
-      activity[item.number] = new Date(latestComment.created_at);
-    }
-  }
-
+  const activity = await getActivityForPRs(items);
   return { items, query, activity };
 }
+
+const formatSlackDate = (d: Date) => {
+  const unixSeconds = Math.floor(d.getTime() / 1000);
+  return `<!date^${unixSeconds}^{date_short}|${d.toDateString()}>`;
+};
 
 async function main() {
   // silence during quiet period
@@ -130,34 +142,27 @@ async function main() {
 
           const activity = electronPRs.activity[item.number];
           const createdAt = new Date(item.created_at);
-          const formatDate = (d: Date) => {
-            const unixSeconds = Math.floor(d.getTime() / 1000);
-            return `<!date^${unixSeconds}^{date_short}|${d.toDateString()}>`;
-          };
-
-          const reviewLabel = activity
-            ? `Last reviewed ${timeAgo(activity)} (${formatDate(activity)})`
-            : `No review since ${timeAgo(createdAt)} (${formatDate(createdAt)})`;
+          const reviewLabel =
+            activity
+              ? `Last reviewed ${timeAgo(activity.created_at)} (${formatSlackDate(
+                  activity.created_at,
+                )})`
+              : `Awaiting review since ${timeAgo(createdAt)} (${formatSlackDate(createdAt)})`;
 
           // TODO(smaddock): highlight first time contributors
 
-          return `• *<${item.html_url}|${escapedTitle} (#${item.number})>*\n_${reviewLabel}_`;
+          return `• *<${item.html_url}|${escapedTitle} (#${item.number})>*\n    _${reviewLabel}_`;
         })
         .join('\n');
   }
 
-  if (text.length === 0) return;
-
-  if (1) {
-    console.log(text);
-    return;
+  if (text.length) {
+    slack.chat.postMessage({
+      channel: '#wg-api',
+      unfurl_links: false,
+      text,
+    });
   }
-
-  slack.chat.postMessage({
-    channel: '#wg-api',
-    unfurl_links: false,
-    text,
-  });
 }
 
 if (require.main === module) main();
