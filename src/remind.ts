@@ -30,10 +30,7 @@ async function main() {
             /[&<>]/g,
             (x) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' })[x]!,
           );
-          const assignment = item.assignees?.length
-            ? item.assignees.map((a) => `@${a!.login}`).join(', ')
-            : '_unassigned_';
-          return `• *<${item.html_url}|${escapedTitle} (#${item.number})>* (${assignment})`;
+          return `• *<${item.html_url}|${escapedTitle} (#${item.number})>*`;
         })
         .join('\n');
     slack.chat.postMessage({
